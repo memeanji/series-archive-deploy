@@ -368,7 +368,7 @@ def render_brand_collection_admin() -> None:
     _gi = database.brand_index_groups().get(sel, {})
     _f = {"brand": sel, "media": [], "status": "전체", "category": "전체",
           "sort": "최근 수집순", "period_days": None}
-    _merged = database.count_ads("meta", {**_f, "merge_variants": True})
+    _merged = database.count_ads("meta", {**_f})   # 기본 묶기(영상 중복 대표) 기준 장수
     st.caption(f"#{_gi.get('index','-')} · **{_gi.get('group','-')}요일** 수집 그룹 · "
                f"page_id **{_pid_now or '없음'}**({cur.get('page_id_status') or 'none'}) · "
                f"광고ID별 **{_sst.get('count','-')}장** / 묶음 **{_merged}장** · 상태 **{_sst.get('status','-')}**")
@@ -776,8 +776,9 @@ def render_filters(opts: dict, header: dict, social_count: int = 0) -> dict:
                                       help="구글 텍스트/검색광고·썸네일 없는 광고는 기본 숨김(개발·디버그용).")
             only_unavail = st.checkbox("상세 확인 불가 광고만 보기", value=False, key="f_unavail",
                                        help="상세에서 '광고 라이브러리에 없습니다'가 뜨는 광고만 모아 봅니다.")
-            merge_variants = st.checkbox("A/B 변형 묶기(같은 문구 1장으로)", value=False, key="f_merge",
-                                         help="끄면 라이브러리처럼 광고 1건당 카드 1장. 켜면 같은 문구의 A/B 변형을 묶어 표시.")
+            show_all = st.checkbox("모든 광고 개별 보기", value=False, key="f_showall",
+                                   help="기본은 같은 영상(YouTube video_id·Meta 동일 썸네일)을 대표 1장으로 묶어 표시. "
+                                        "켜면 라이브러리처럼 광고 1건당 카드 1장.")
             include_estimated = st.checkbox("🟡 브랜드 추정 광고도 포함(구글)", value=False, key="f_estimated",
                                             help="구글: 기본은 '브랜드 확정'만. 켜면 '추정' 광고도 함께 표시.")
 
@@ -810,7 +811,7 @@ def render_filters(opts: dict, header: dict, social_count: int = 0) -> dict:
         "only_bookmark": only_bm,
         "show_hidden": show_hidden,
         "only_unavailable": only_unavail,
-        "merge_variants": merge_variants,
+        "show_all_individual": show_all,   # 기본 False = 영상 중복 묶기
         "include_estimated": include_estimated,
     }
 
@@ -1466,6 +1467,15 @@ def render_ad_detail(ad: dict) -> None:
                 badges.append(_b("↗ 원본 확인 필요", "#F1F5F9", S.SUB, S.BORDER))
         st.markdown("<div style='display:flex;flex-wrap:wrap;gap:7px;margin:2px 0 18px'>"
                     + "".join(badges) + "</div>", unsafe_allow_html=True)
+        # 같은 소재(영상 중복)로 묶인 광고 수 + 판정 근거
+        dupn = int(ad.get("dup_rows") or 1)
+        if dupn >= 2:
+            gk = str(ad.get("grp_key") or "")
+            basis = ("YouTube video_id 동일" if gk.startswith("yt:")
+                     else "동일 소재 후보(썸네일 SHA-256·카피·랜딩 일치)" if gk.startswith("meta:")
+                     else "동일 그룹")
+            st.caption(f"📎 같은 소재로 등록된 광고 **{dupn}개** · 판정근거: {basis} "
+                       "— 목록엔 대표 1건만 표시(‘모든 광고 개별 보기’로 전건 확인).")
 
         # ── 지표(숫자 중심, 낮은 색 강조) — 구글/유튜브 공개 지표 ──
         yv, yl, yc = (int(ad.get("yt_views") or 0), int(ad.get("yt_likes") or 0),

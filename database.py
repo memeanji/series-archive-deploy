@@ -41,6 +41,7 @@ AD_COLS = [
     "page_id", "last_seen_at",   # page_id 기반 수집 + 마지막으로 라이브러리에서 본 시각
     # Google: 법인(광고주)과 브랜드 분리 + 광고단위 브랜드 재매칭
     "advertiser_name", "brand_status", "match_method", "match_confidence", "manual_override",
+    "content_hash", "dedupe_key",   # 썸네일 SHA-256 + 영상 중복 그룹 키(재수집 시 재계산)
 ]
 SOCIAL_COLS = [
     "id", "brand_name", "platform", "video_id", "embed_url", "title", "channel_title",
@@ -57,6 +58,105 @@ def _now() -> str:
 
 def hash_pw(pw: str) -> str:
     return hashlib.sha256(str(pw).encode("utf-8")).hexdigest()
+
+
+# ── 영상 중복 판별(보수적) ─────────────────────────────────
+#   ① YouTube/구글: video_id 동일 → 확정 동일영상
+#   ② Meta: 영상ID 없음 → brand+정규화카피+landing+'로컬 썸네일 SHA-256'이 모두 같을 때만 '동일 소재 후보'
+#   ③ 썸네일 없음/해시 다름 → 개별 유지(과병합 금지). perceptual hash는 쓰지 않음.
+import re as _re
+
+_YT_RE = _re.compile(r"(?:youtube\.com/(?:watch\?v=|shorts/|embed/)|youtu\.be/)([A-Za-z0-9_-]{6,})")
+
+
+def _yt_video_id(url: str) -> str:
+    m = _YT_RE.search(url or "")
+    return m.group(1) if m else ""
+
+
+def _norm_copy(s: str) -> str:
+    return _re.sub(r"\s+", " ", (s or "")).strip().lower()
+
+
+def _thumb_local_file(row) -> Path:
+    """local_thumbnail_path>thumbnail_url>preview_url 중 '로컬 파일'을 프로젝트 루트 기준으로 안전 해석.
+    없으면 None. (http/data URI 는 제외 — 파일 해시 불가)"""
+    def g(k):
+        try:
+            return (row[k] or "").strip()
+        except Exception:  # sqlite3.Row/dict 공용
+            return (row.get(k) or "").strip() if hasattr(row, "get") else ""
+    for k in ("local_thumbnail_path", "thumbnail_url", "preview_url"):
+        v = g(k)
+        if not v or v.startswith("http") or v.startswith("data:"):
+            continue
+        rel = v[len("app/"):] if v.startswith("app/") else v   # 'app/static/..' → 'static/..'
+        p = (ROOT / rel)
+        if p.exists():
+            return p
+    return None
+
+
+def _thumb_sha256(local_thumbnail_path_or_row) -> str:
+    """로컬 썸네일 파일 SHA-256. 파일 없으면 '' (=Meta 병합 안 함)."""
+    row = local_thumbnail_path_or_row
+    if isinstance(row, str):
+        row = {"local_thumbnail_path": row}
+    f = _thumb_local_file(row)
+    if not f:
+        return ""
+    h = hashlib.sha256()
+    try:
+        with open(f, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def compute_dedupe_key(row, content_hash: str = None) -> str:
+    """보수적 영상 중복 키. 없으면 '' → 개별 유지."""
+    def g(k):
+        try:
+            return row[k]
+        except Exception:
+            return row.get(k) if hasattr(row, "get") else None
+    vid = _yt_video_id(g("video_url") or "")
+    if vid:
+        return f"yt:{vid}"                                    # 기준: video_id
+    if (g("platform") or "") == "meta":
+        ch = content_hash if content_hash is not None else _thumb_sha256(row)
+        copy = _norm_copy(g("ad_copy"))
+        land = (g("landing_url") or "").strip().lower()
+        if ch and copy and land:                             # 썸네일 해시까지 정확히 같을 때만
+            sig = f"{g('brand_name') or ''}|{copy}|{land}|{ch}"
+            return "meta:" + hashlib.sha256(sig.encode("utf-8")).hexdigest()   # 컴팩트(전체카피 저장 안 함), 기준: exact thumbnail hash
+    return ""    # 영상ID 없음·썸네일 없음/해시 다름 → 별도 광고로 유지
+
+
+def backfill_dedupe_keys(conn: sqlite3.Connection = None, only_missing: bool = True) -> int:
+    """content_hash(썸네일 SHA-256) + dedupe_key 백필. 썸네일 있는 로컬에서 실행.
+    행/썸네일 삭제·사용자데이터 변경 없음(dedupe_key/content_hash 컬럼만 UPDATE)."""
+    own = conn is None
+    conn = conn or get_conn()
+    sel = ("SELECT id, platform, media_type, brand_name, ad_copy, landing_url, video_url, "
+           "local_thumbnail_path, thumbnail_url, preview_url, content_hash FROM ad_library_ads")
+    if only_missing:
+        sel += " WHERE dedupe_key IS NULL OR dedupe_key=''"
+    rows = conn.execute(sel).fetchall()
+    n = 0
+    for r in rows:
+        d = dict(r)
+        ch = d.get("content_hash") or (_thumb_sha256(d) if (d.get("platform") == "meta") else "")
+        key = compute_dedupe_key(d, content_hash=ch)
+        conn.execute("UPDATE ad_library_ads SET content_hash=?, dedupe_key=? WHERE id=?",
+                     (ch, key, d["id"]))
+        n += 1
+    conn.commit()
+    if own:
+        conn.close()
+    return n
 
 
 def get_conn() -> sqlite3.Connection:
@@ -206,7 +306,9 @@ def init_db(seed_users: Optional[dict] = None) -> None:
                  ("match_method", "TEXT"),           # domain/brand_text/product_keyword/company_only/unmatched/manual
                  ("match_confidence", "TEXT"),       # high/medium/low/none
                  ("manual_override", "INTEGER DEFAULT 0"),
-                 ("match_reason", "TEXT")):          # 왜 매칭됐는지(화면 표시용)
+                 ("match_reason", "TEXT"),           # 왜 매칭됐는지(화면 표시용)
+                 ("content_hash", "TEXT"),           # 로컬 썸네일 SHA-256(1회 계산·재사용)
+                 ("dedupe_key", "TEXT")):            # 영상 중복 그룹 키(보수적). ''/NULL=개별 유지
         if c not in cols:
             conn.execute(f"ALTER TABLE ad_library_ads ADD COLUMN {c} {t}")
     # brands 테이블 page_id 컬럼
@@ -277,6 +379,7 @@ def _ensure_indexes(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_ala_platform ON ad_library_ads(platform)",
         # 기본 정렬(최근 수집순)
         "CREATE INDEX IF NOT EXISTS idx_ala_collected ON ad_library_ads(collected_at)",
+        "CREATE INDEX IF NOT EXISTS idx_ala_dedupe ON ad_library_ads(dedupe_key)",
         "CREATE INDEX IF NOT EXISTS idx_ala_brandid ON ad_library_ads(brand_id)",
         # 소셜 매칭 조인(ROW_NUMBER PARTITION BY ad_id ORDER BY match_score)
         "CREATE INDEX IF NOT EXISTS idx_asm_ad ON ad_social_matches(ad_id, match_score, social_id)",
@@ -377,6 +480,42 @@ _JOIN = (" FROM ad_library_ads a "
          "ROW_NUMBER() OVER (PARTITION BY ad_id ORDER BY match_score DESC, social_id) rn "
          "FROM ad_social_matches) m ON m.ad_id=a.id AND m.rn=1 "
          "LEFT JOIN social_videos s ON s.id=m.social_id")
+
+# ── 영상 중복 묶기용: 그룹키 + 대표선택 + 윈도우 요약(대표1건 + 그룹 전체 집계) ──
+#   그룹키: dedupe_key(없으면 id=개별). "모든 광고 개별 보기" 시 a.id.
+#   대표선택 우선순위: ①사용자데이터(북마크/메모/스크립트) ②활성(live) ③최근수집 ④채워진필드 많음.
+_REP = ("(CASE WHEN a.is_bookmarked=1 OR length(COALESCE(a.memo,''))>0 "
+        "OR length(COALESCE(a.script_text,''))>0 THEN 1 ELSE 0 END) DESC, "
+        "(CASE WHEN a.status='live' THEN 1 ELSE 0 END) DESC, a.collected_at DESC, "
+        "((length(COALESCE(a.ad_copy,''))>0)+(a.video_url<>'')+(a.landing_url<>'')) DESC, a.id")
+
+# 윈도우 요약 컬럼(GROUP BY 없이 대표1건 + dup_rows + 그룹 사용자데이터 집계). {GRP}/{REP} 치환.
+_SUMMARY_COLS_WIN = (
+    "a.id, a.brand_name, a.ad_title, substr(a.ad_copy,1,90) AS ad_copy_short, "
+    "a.platform, a.status, a.thumbnail_url, a.local_thumbnail_path, a.preview_url, a.video_url, a.score, "
+    "a.media_type, a.ad_format, a.collected_at, a.started_at, a.is_bookmarked, "
+    "a.scrape_status, a.error_message, a.platforms, a.detail_status, a.video_status, a.brand_status, "
+    "a.yt_views, a.yt_likes, a.yt_comments, a.yt_embeddable, a.fatigue_status, "
+    "(CASE WHEN length(a.memo)>0 THEN 1 ELSE 0 END) AS has_memo, "
+    "m.match_score AS match_score, s.final_grade AS social_final_grade, "
+    "s.views AS social_views, s.likes AS social_likes, "
+    "s.engagement_score AS social_engagement_score, s.platform AS social_platform, "
+    "COUNT(*) OVER (PARTITION BY {GRP}) AS dup_rows, "
+    "MAX(a.ad_variant_count) OVER (PARTITION BY {GRP}) AS variant_count, "
+    "ROW_NUMBER() OVER (PARTITION BY {GRP} ORDER BY {REP}) AS rn, "
+    "MAX(a.is_bookmarked) OVER (PARTITION BY {GRP}) AS grp_bookmarked, "
+    "MAX(CASE WHEN length(COALESCE(a.memo,''))>0 THEN 1 ELSE 0 END) OVER (PARTITION BY {GRP}) AS grp_has_memo, "
+    "MAX(CASE WHEN length(COALESCE(a.script_text,''))>0 THEN 1 ELSE 0 END) OVER (PARTITION BY {GRP}) AS grp_has_script, "
+    "MAX(a.dedupe_key) OVER (PARTITION BY {GRP}) AS grp_key"
+)
+
+
+def _grp(f: dict) -> str:
+    """카드 묶음 기준. 기본=영상 중복 묶기(dedupe_key, 없으면 개별 id). 토글 시 전건 개별."""
+    if f.get("show_all_individual"):
+        return "a.id"
+    return "COALESCE(NULLIF(a.dedupe_key,''), a.id)"
+
 
 _GRADE_SET = {"S급": "('S')", "A급 이상": "('S','A')", "B급 이상": "('S','A','B')",
               "C급 이상": "('S','A','B','C')"}
@@ -479,18 +618,29 @@ def _group_key(f: dict) -> str:
 def count_ads(tab: str, f: dict) -> int:
     where, p = _where(tab, f)
     conn = get_conn()
-    n = conn.execute(f"SELECT COUNT(DISTINCT {_group_key(f)}) {_JOIN} WHERE {where}", p).fetchone()[0]
+    n = conn.execute(f"SELECT COUNT(DISTINCT {_grp(f)}) {_JOIN} WHERE {where}", p).fetchone()[0]
     conn.close()
     return n
 
 
+def _outer_order(order: str) -> str:
+    """_order()의 a./s. prefix를 외부 서브쿼리 alias(t.)로 변환(윈도우 대표선택 쿼리용)."""
+    return (order.replace("s.final_grade", "t.social_final_grade")
+                 .replace("s.engagement_score", "t.social_engagement_score")
+                 .replace("s.views", "t.social_views")
+                 .replace("a.", "t."))
+
+
 def load_ads_page(tab: str, f: dict, page: int = 1, page_size: int = 12) -> list[dict]:
     where, p = _where(tab, f)
-    order = _order(tab, f.get("sort", ""))
+    grp = _grp(f)
+    cols = _SUMMARY_COLS_WIN.format(GRP=grp, REP=_REP)
+    order = _outer_order(_order(tab, f.get("sort", "")))
     conn = get_conn()
+    # 윈도우로 그룹당 대표(rn=1)만 노출 + dup_rows/grp_* 로 그룹 전체값 집계(행 삭제 없음).
     rows = conn.execute(
-        f"SELECT {_SUMMARY_COLS} {_JOIN} WHERE {where} "
-        f"GROUP BY {_group_key(f)} {order} LIMIT ? OFFSET ?",
+        f"SELECT * FROM (SELECT {cols} {_JOIN} WHERE {where}) t "
+        f"WHERE t.rn=1 {order} LIMIT ? OFFSET ?",
         p + [page_size, max(0, (page - 1) * page_size)]).fetchall()
     conn.close()
     return [dict(r) for r in rows]
@@ -908,6 +1058,9 @@ def ingest_ad_library(ads: list[dict]) -> int:
             "match_confidence": (prev or {}).get("match_confidence") or "",
             "manual_override": (prev or {}).get("manual_override") or 0,
         }
+        # 영상 중복키(신규/재수집분도 자동 세팅 → 재발 방지). content_hash=썸네일 SHA-256(있을 때).
+        row["content_hash"] = _thumb_sha256(row) if row["platform"] == "meta" else ""
+        row["dedupe_key"] = compute_dedupe_key(row, content_hash=row["content_hash"])
         conn.execute(f"INSERT OR REPLACE INTO ad_library_ads({','.join(AD_COLS)}) "
                      f"VALUES({','.join(['?']*len(AD_COLS))})", tuple(row[c] for c in AD_COLS))
         n += 1
