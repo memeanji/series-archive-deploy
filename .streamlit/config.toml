@@ -1,0 +1,17 @@
+# Series Archive — 그린/민트 라이트 테마
+[theme]
+base = "light"
+primaryColor = "#03C75A"
+backgroundColor = "#F8FAFC"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#1E293B"
+borderColor = "#E2E8F0"
+font = "sans serif"
+
+[server]
+runOnSave = true
+enableStaticServing = true
+
+[client]
+# 뷰어 모드 — 개발자용 단축키(C=clear cache, R=rerun)·툴바 비활성화
+toolbarMode = "viewer"

@@ -1,0 +1,30 @@
+# ── 비밀 (절대 커밋 금지) ──
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# ── 데이터: demo.db·repurely json 은 추적, 나머지 제외 ──
+data/*.db
+data/local_db.json
+data/user_state.json
+data/_*
+
+# ── 썸네일은 외부 이미지 스토리지로 이전 (배포 레포엔 포함 안 함) ──
+static/thumbnails/
+
+# ── 캐시/생성물 ──
+__pycache__/
+*.pyc
+*.log
+logs/
+downloads/
+temp/
+cache/
+.venv/
+venv/
+
+# ── 백업·개발 스크립트 (루트 한정 — 패키지 __init__.py·_helper 는 보존) ──
+*.backup-*
+/_*.py
+/probe_*.py

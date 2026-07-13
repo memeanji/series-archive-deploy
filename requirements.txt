@@ -1,0 +1,12 @@
+# Series Archive — Streamlit Cloud용(보기 전용) 의존성. 가볍게 유지.
+streamlit>=1.33          # 뷰어/앱
+python-dotenv>=1.0       # .env 로드
+requests>=2.31           # YouTube/Gemini/Apify/메타 API
+pandas>=2.0              # 7일 추이 차트
+youtube-transcript-api>=1.2  # YouTube 자막(스크립트)
+gspread>=6.0             # 구글시트 스토리보드 컷별 자막 입력(서비스계정)
+
+# ── 아래는 '수집(크롤링)'에만 필요 — Cloud(보기 전용)에선 불필요해 제외 ──
+# 로컬/Docker에서 크롤하려면 별도 설치:
+#   pip install playwright>=1.40 && playwright install chromium
+# (앱 실행 시점에 import 하지 않으므로 Cloud 빌드에는 영향 없음)
