@@ -134,16 +134,18 @@ def _fetch(table: str, query: str, verify: bool = True) -> list[dict]:
             break
         start += len(rows)
     if verify and total is not None and total >= 0:
+        if len(out) != total:
+            raise RuntimeError(f"{table} 적재 검증 실패 — 서버 {total:,} / 받은 {len(out):,}")
         key = _ORDER_KEY.get(table)
-        if key and out:
+        # 고유성 검사는 **정렬키 컬럼이 응답에 실제로 있을 때만**.
+        # (select 에 키를 안 넣으면 전부 None 이 돼 '중복'으로 오탐한다 — brands?select=display_name)
+        if key and out and all(c in out[0] for c in key.split(",")):
             cols = key.split(",")
             uniq = {tuple(r.get(c) for c in cols) for r in out}
-            if len(uniq) != len(out) or len(out) != total:
+            if len(uniq) != len(out):
                 raise RuntimeError(
-                    f"{table} 적재 검증 실패 — 서버 {total:,} / 받은 {len(out):,} / "
-                    f"고유 {len(uniq):,} (중복 {len(out) - len(uniq):,})")
-        elif len(out) != total:
-            raise RuntimeError(f"{table} 적재 검증 실패 — 서버 {total:,} / 받은 {len(out):,}")
+                    f"{table} 적재 검증 실패 — 받은 {len(out):,} / 고유 {len(uniq):,} "
+                    f"(중복 {len(out) - len(uniq):,})")
     return out
 
 

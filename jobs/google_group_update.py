@@ -95,6 +95,14 @@ def main(weekday: int = None) -> None:
     database.migrate_brands()
 
     # demo.db + push
+    # ── Supabase 신규분 동기화 — **git push 와 완전히 분리**(push 를 꺼도 항상 수행) ──
+    #    새 광고/브랜드/썸네일만 올린다. 이미 올라간 건 건너뛰므로 재실행해도 중복이 안 생긴다.
+    try:
+        import jobs.supabase_sync_new as SN
+        SN.run(apply=True)
+    except Exception as e:  # noqa: BLE001  (동기화 실패가 수집 결과를 되돌리지 않게)
+        _log(f"Supabase 신규 동기화 실패(다음 회차에 재시도): {type(e).__name__}: {e}")
+
     try:
         database.regenerate_demo_db()
     except Exception as e:  # noqa: BLE001
