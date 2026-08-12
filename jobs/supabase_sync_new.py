@@ -139,7 +139,7 @@ def run(apply: bool = False, days: int = 0, workers: int = 8) -> dict:
         key = key_of.get(a["id"], "")
         rows.append(sm._clean(a, cols["ad_library_ads"], {
             "storage_path": key,
-            "thumbnail_url": sm.public_url(key) if key else "",
+            "thumbnail_url": sm.public_url(key) if key else (a.get("thumbnail_url") or ""),
             "orig_thumbnail_url": a.get("thumbnail_url") or "",
             "local_thumbnail_path": key,
             "is_preserved": 1 if a.get("brand_name") in _PRESERVED else (a.get("is_preserved") or 0),

@@ -272,7 +272,8 @@ def migrate_tables(data: dict, thumbs: dict[str, list[str]], apply: bool,
         key = PREFIX + Path(fs[0]).name if fs else ""
         ads.append(_clean(a, cols["ad_library_ads"], {
             "storage_path": key,
-            "thumbnail_url": public_url(key) if key else "",
+            # Storage 사본이 없으면 원격 URL(ytimg 등)을 지우지 말고 유지 — 지우면 카드가 빈다
+            "thumbnail_url": public_url(key) if key else (a.get("thumbnail_url") or ""),
             "orig_thumbnail_url": a.get("thumbnail_url") or "",
             "local_thumbnail_path": key,          # 로컬 경로 대신 Storage 경로만 저장
             # 장기보존 브랜드만 1. 나머지는 원본 값(0) 그대로 둬서 60일 retention이 적용되게 한다.
