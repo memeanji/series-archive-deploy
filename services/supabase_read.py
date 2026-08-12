@@ -34,9 +34,19 @@ _stats: dict = {}          # 진단용: 브랜드별 마지막 하이드레이�
 
 
 # ── 설정 ────────────────────────────────────────────────────────────────
+def _flag(name: str) -> bool:
+    """Secrets 값이 문자열이든 TOML 불리언이든 동일하게 해석.
+    ⚠️ `SUPABASE_READ_ALL = true`(따옴표 없는 불리언)로 적으면 예전 코드가 .strip() 에서
+       AttributeError → 상위에서 조용히 SQLite 폴백 → **화면이 텅 비는** 사고가 났다."""
+    v = config.secret(name)
+    if isinstance(v, bool):
+        return v
+    return str(v or "").strip().lower() in ("true", "1", "yes", "on")
+
+
 def brands() -> list[str]:
-    raw = config.secret("SUPABASE_READ_BRANDS") or ""
-    return [b.strip() for b in raw.split(",") if b.strip()]
+    raw = config.secret("SUPABASE_READ_BRANDS")
+    return [b.strip() for b in str(raw or "").split(",") if b.strip()]
 
 
 def enabled() -> bool:
@@ -56,10 +66,9 @@ def handles(brand: str | None) -> bool:
 
 
 def read_all() -> bool:
-    """SUPABASE_READ_ALL=true → **로컬 DB 없이 Supabase만으로** 전 브랜드를 읽는다.
+    """SUPABASE_READ_ALL 이 참이면 **로컬 DB 없이 Supabase만으로** 전 브랜드를 읽는다.
     (배포본 전용. 로컬 개발/수집 환경은 기본 false 라 기존 동작 그대로.)"""
-    return (config.secret("SUPABASE_READ_ALL") or "").strip().lower() == "true" and bool(
-        config.secret("SUPABASE_URL"))
+    return _flag("SUPABASE_READ_ALL") and bool(config.secret("SUPABASE_URL"))
 
 
 def last_error() -> str:
@@ -272,7 +281,9 @@ def conn_all():
         return c
     except Exception as e:  # noqa: BLE001
         _last_error = f"{type(e).__name__}: {e}"
-        print(f"  [supabase_read] 전체 미러 실패: {_last_error}")
+        print("[supabase_read] 전체 미러 실패 — 화면이 비어 보일 수 있음: "
+              + _last_error + " / 확인: SUPABASE_URL · SUPABASE_SERVICE_KEY · SUPABASE_READ_ALL",
+              flush=True)
         return None
 
 
