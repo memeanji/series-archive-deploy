@@ -13,6 +13,7 @@ import streamlit.components.v1 as stc
 
 import database
 import services.youtube as YT
+import services.thumbnail_store as thumbnail_store
 import styles as S
 from services.urls import is_valid_external_url, normalize_google_transparency_url
 
@@ -174,8 +175,30 @@ def _file_data_uri(rel_path: str) -> str:
 
 
 def get_display_thumbnail(ad: dict) -> dict:
-    """카드/상세 공통 썸네일 결정. 우선순위: thumbnail_path>thumbnail_url>preview_url>image_url>media_url.
+    """카드/상세 공통 썸네일 결정. 우선순위: (R2 공개URL) > thumbnail_path>thumbnail_url>preview_url>image_url>media_url.
     로컬 static 경로는 data URI로 변환, http(s)는 그대로. 반환: {src, source, method, exists}."""
+    # R2 활성 시: 로컬 썸네일 파일명 → R2 공개 URL 우선(브라우저 직접 로드). 미설정/오류면 아래 로컬 폴백.
+    try:
+        if thumbnail_store.is_enabled():
+            for key in ("local_thumbnail_path", "thumbnail_url"):
+                v = (ad.get(key) or "").strip()
+                if v and not v.startswith(("http://", "https://", "data:")):
+                    url = thumbnail_store.public_url(v)
+                    if url:
+                        return {"src": url, "source": "r2", "method": "url", "exists": True}
+    except Exception:  # noqa: BLE001  (R2 판단 실패 → 조용히 로컬 폴백)
+        pass
+    # Supabase Storage 로 이전된 행: local_thumbnail_path 가 'thumbnails/<파일>' 형태 → 공개 URL 로 직접.
+    #   (이 경로는 로컬 디스크에 없으므로 아래 파일 폴백에서 헛되이 찾지 않도록 먼저 처리)
+    try:
+        v = (ad.get("local_thumbnail_path") or "").strip()
+        if v.startswith("thumbnails/"):
+            import services.supabase_read as _sr
+            url = _sr.storage_url(v)
+            if url:
+                return {"src": url, "source": "supabase_storage", "method": "url", "exists": True}
+    except Exception:  # noqa: BLE001  (판단 실패 → 아래 기존 폴백 그대로)
+        pass
     # local_thumbnail_path(영구 로컬 파일) 최우선 → thumbnail_url(로컬경로 또는 만료 fbcdn) → 기타
     for key in ("local_thumbnail_path", "thumbnail_path", "thumbnail_url",
                 "preview_url", "image_url", "media_url"):
@@ -1331,6 +1354,14 @@ def _render_trend_section(ad: dict, aid: str) -> None:
                 unsafe_allow_html=True)
     st.markdown("<div style='font-size:14px;font-weight:800;color:#1E293B;margin-bottom:8px'>"
                 "📈 조회수 추이</div>", unsafe_allow_html=True)
+    # 복원분(과거 git 기록에서 되살린 조회수)이 섞여 있으면 몇 건인지 알려준다 — 데이터 자체는 동일하게 사용
+    try:
+        _srcs = database.snapshot_source_counts(aid)
+        _rec = int(_srcs.get("git_yt_views", 0)) + int(_srcs.get("git_restore", 0))
+        if _rec:
+            st.caption(f"총 {sum(_srcs.values())}개 지점 중 {_rec}개는 과거 기록에서 복원한 값입니다.")
+    except Exception:  # noqa: BLE001
+        pass
     if len(snaps) < 2:
         st.markdown(f"<div style='font-size:12px;color:#94A3B8;line-height:1.5;"
                     f"padding:11px 13px;background:{S.BG};border:1px solid {S.BORDER};border-radius:10px'>"
@@ -1372,12 +1403,22 @@ def render_ad_detail(ad: dict) -> None:
         database.set_yt_embeddable(aid, emb)
     blocked = yt_vid and (emb == 0 or emb is False)
 
-    # ── 헤더: 브랜드명(가장 크게) + 우측 북마크 별 아이콘 ──
-    hc = st.columns([8, 1])
+    # ── 헤더: 브랜드명(가장 크게) + 우측 [보존 토글] + [북마크 별] (개념 구분) ──
+    preserved = bool(ad.get("is_preserved"))
+    hc = st.columns([7, 1, 1])
     hc[0].markdown(f"<div style='font-size:23px;font-weight:800;color:{S.PRIMARY};"
                    f"letter-spacing:-.3px;line-height:1.25;margin-top:2px'>"
                    f"{_h.escape(_g(ad,'brand_name','-'))}</div>", unsafe_allow_html=True)
-    if hc[1].button("★" if marked else "☆", key=f"bmtop_{aid}", use_container_width=True,
+    # 보존: retention(60일 자동정리)에서 이 광고를 제외. 북마크와 별개.
+    if hc[1].button("🔒 보존" if preserved else "🔓 보존", key=f"preservetop_{aid}",
+                    use_container_width=True,
+                    type=("primary" if preserved else "secondary"),
+                    help=("자동정리(60일) 보존 중 — 눌러서 해제" if preserved
+                          else "자동정리(60일)에서 이 광고 삭제 제외로 표시")):
+        database.update_preserved(aid, not preserved)
+        _reload()
+    # 북마크: 관심 광고 저장(별개 개념)
+    if hc[2].button("★" if marked else "☆", key=f"bmtop_{aid}", use_container_width=True,
                     type=("primary" if marked else "secondary"),
                     help="북마크 해제" if marked else "북마크 저장"):
         database.update_bookmark(aid, not marked, st.session_state.get('username',''))
@@ -1478,8 +1519,22 @@ def render_ad_detail(ad: dict) -> None:
                        "— 목록엔 대표 1건만 표시(‘모든 광고 개별 보기’로 전건 확인).")
 
         # ── 지표(숫자 중심, 낮은 색 강조) — 구글/유튜브 공개 지표 ──
+        # 현재 조회수는 **영상 단위 최신값**(video_view_state)을 우선 사용하고, 없으면 광고 행의 yt_*.
+        # (추이 그래프는 아래에서 스냅샷을 그대로 사용 — 역할 분리)
         yv, yl, yc = (int(ad.get("yt_views") or 0), int(ad.get("yt_likes") or 0),
                       int(ad.get("yt_comments") or 0))
+        _checked_at = ""
+        try:
+            import services.youtube as _YT
+            _vid = _YT.extract_video_id(ad.get("video_url") or "")
+            _st = database.get_video_view_state(_vid) if _vid else None
+            if _st and int(_st.get("current_view_count") or 0) > 0:
+                yv = int(_st["current_view_count"])
+                yl = int(_st.get("current_like_count") or yl)
+                yc = int(_st.get("current_comment_count") or yc)
+                _checked_at = (_st.get("last_checked_at") or "")[:16].replace("T", " ")
+        except Exception:  # noqa: BLE001  (상태 테이블 없거나 조회 실패 → 기존 값 그대로)
+            pass
         if ad.get("video_url") and (yv or yl or yc):
             # 배경색 있는 카드(색강조) — 조회수/좋아요/댓글
             cards = [("👁", "조회수", _full(yv), "#03C75A"),
@@ -1493,6 +1548,8 @@ def render_ad_detail(ad: dict) -> None:
                          f"<div style='font-size:24px;font-weight:900;color:{col};"
                          f"line-height:1.3;font-variant-numeric:tabular-nums'>{val}</div></div>")
             st.markdown(html + "</div>", unsafe_allow_html=True)
+            if _checked_at:
+                st.caption(f"조회수 최종 확인 {_checked_at} · 아래 추이는 하루 1회 저장된 스냅샷 기준")
         # (메타·구글 반응지표 미제공 안내문구 삭제)
 
         # ── 보조 정보: 게재 시작 · 수집 · 광고 ID ──

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,6 +43,7 @@ AD_COLS = [
     # Google: 법인(광고주)과 브랜드 분리 + 광고단위 브랜드 재매칭
     "advertiser_name", "brand_status", "match_method", "match_confidence", "manual_override",
     "content_hash", "dedupe_key",   # 썸네일 SHA-256 + 영상 중복 그룹 키(재수집 시 재계산)
+    "first_seen_at", "is_preserved",  # 최초 발견일(1회 고정, 분석용) + 수동 보존 표시(retention 제외)
 ]
 SOCIAL_COLS = [
     "id", "brand_name", "platform", "video_id", "embed_url", "title", "channel_title",
@@ -159,7 +161,43 @@ def backfill_dedupe_keys(conn: sqlite3.Connection = None, only_missing: bool = T
     return n
 
 
-def get_conn() -> sqlite3.Connection:
+def backfill_seen_columns(conn: sqlite3.Connection = None) -> tuple[int, int]:
+    """first_seen_at / last_seen_at 백필(빈 값만). 행 삭제·사용자데이터 변경 없음.
+    - first_seen_at: 가장 오래된 ad_view_snapshots.snapshot_date → created_at → started_at (분석/표시용)
+    - last_seen_at : 빈 값만 last_crawled_at → collected_at → created_at 로 보정(삭제 기준)
+    반환: (first_seen 채운 행수, last_seen 채운 행수). 재실행 idempotent."""
+    own = conn is None
+    conn = conn or get_conn()
+    f = conn.execute("""
+        UPDATE ad_library_ads SET first_seen_at = COALESCE(
+            (SELECT MIN(s.snapshot_date) FROM ad_view_snapshots s WHERE s.ad_id = ad_library_ads.id),
+            NULLIF(created_at, ''), NULLIF(started_at, ''))
+        WHERE first_seen_at IS NULL OR first_seen_at = ''""").rowcount
+    l = conn.execute("""
+        UPDATE ad_library_ads SET last_seen_at = COALESCE(
+            NULLIF(last_crawled_at, ''), NULLIF(collected_at, ''), created_at)
+        WHERE last_seen_at IS NULL OR last_seen_at = ''""").rowcount
+    conn.commit()
+    if own:
+        conn.close()
+    return f, l
+
+
+def get_conn(local: bool = False) -> sqlite3.Connection:
+    """DB 커넥션.
+
+    `SUPABASE_READ_ALL=true`(번들 DB 없는 배포본)이면 **Supabase 미러**를 돌려준다.
+    조회 SQL은 하나도 바꾸지 않고 데이터 출처만 바뀌므로, 화면 결과는 기존과 동일하다.
+    `local=True` 는 부팅/스키마 생성처럼 진짜 로컬 파일이 필요한 경우에만 쓴다."""
+    if not local:
+        try:
+            import services.supabase_read as _sr
+            if _sr.read_all():
+                c = _sr.conn_all()
+                if c is not None:
+                    return c
+        except Exception as e:  # noqa: BLE001
+            print(f"  [DB] Supabase 미러 실패 → 로컬 사용: {type(e).__name__}: {e}")
     DATA.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
@@ -171,6 +209,28 @@ def get_conn() -> sqlite3.Connection:
     except Exception:  # noqa: BLE001
         pass
     return conn
+
+
+def _read_conn(brand: str | None = None):
+    """조회 전용 커넥션. `SUPABASE_READ_BRANDS` 에 든 브랜드면 **Supabase 미러**, 아니면 로컬 SQLite.
+    Supabase 쪽이 조금이라도 어긋나면 즉시 SQLite로 폴백한다(앱이 멈추지 않게).
+    반환 (conn, source) — source 는 'supabase' | 'sqlite' (성능/진단 로그용)."""
+    try:
+        import services.supabase_read as sr       # lazy: 미설정이면 비용 0
+        if sr.read_all():                          # 배포본: 번들 DB 없이 Supabase 단독
+            c = sr.conn_all()
+            if c is not None:
+                return c, "supabase"
+        elif brand and sr.handles(brand):
+            c = sr.conn(brand)
+            if c is not None:
+                return c, "supabase"
+    except Exception as e:  # noqa: BLE001
+        print(f"  [읽기] Supabase 경로 실패 → SQLite 폴백: {type(e).__name__}: {e}")
+    return get_conn(), "sqlite"
+
+
+LAST_READ_SOURCE = "sqlite"     # 마지막 조회가 어디서 왔는지(사이드바 진단 표시용)
 
 
 def _db_build_of(path) -> str:
@@ -194,9 +254,10 @@ def init_db(seed_users: Optional[dict] = None) -> None:
     is_cloud = "/mount/src" in str(ROOT).replace("\\", "/")
     seed = ROOT / "sample_data" / "demo.db"
     if not DB_PATH.exists():
+        DATA.mkdir(parents=True, exist_ok=True)
         if seed.exists():
-            DATA.mkdir(parents=True, exist_ok=True)
             shutil.copy(seed, DB_PATH)
+        # 번들 DB가 없는 배포본(Supabase 단독)이면 빈 스키마만 만들고 진행 — 읽기는 Supabase가 담당
     elif is_cloud and seed.exists():
         seed_build = _db_build_of(seed)
         if seed_build and seed_build != _db_build_of(DB_PATH):
@@ -208,7 +269,8 @@ def init_db(seed_users: Optional[dict] = None) -> None:
                     except Exception:  # noqa: BLE001
                         pass
             shutil.copy(seed, DB_PATH)
-    conn = get_conn()
+    # 스키마는 항상 **로컬 파일**에 만든다 — Supabase 미러가 이 스키마를 그대로 복제해 쓰기 때문.
+    conn = get_conn(local=True)
     conn.executescript("""
     CREATE TABLE IF NOT EXISTS ad_library_ads (
         id TEXT PRIMARY KEY, brand_name TEXT, ad_title TEXT, ad_copy TEXT,
@@ -308,7 +370,9 @@ def init_db(seed_users: Optional[dict] = None) -> None:
                  ("manual_override", "INTEGER DEFAULT 0"),
                  ("match_reason", "TEXT"),           # 왜 매칭됐는지(화면 표시용)
                  ("content_hash", "TEXT"),           # 로컬 썸네일 SHA-256(1회 계산·재사용)
-                 ("dedupe_key", "TEXT")):            # 영상 중복 그룹 키(보수적). ''/NULL=개별 유지
+                 ("dedupe_key", "TEXT"),             # 영상 중복 그룹 키(보수적). ''/NULL=개별 유지
+                 ("first_seen_at", "TEXT"),          # 최초 발견 시각(재수집 시 유지). 분석/표시용
+                 ("is_preserved", "INTEGER DEFAULT 0")):  # 1=수동 보존(60일 지나도 retention 제외)
         if c not in cols:
             conn.execute(f"ALTER TABLE ad_library_ads ADD COLUMN {c} {t}")
     # brands 테이블 page_id 컬럼
@@ -369,6 +433,35 @@ def init_db(seed_users: Optional[dict] = None) -> None:
     conn.close()
 
 
+# 무거운 초기화를 다시 돌리기까지의 간격(초). env INIT_REFRESH_SEC 로 조정, 0이면 항상 수행.
+_INIT_REFRESH_SEC = int(os.environ.get("INIT_REFRESH_SEC", "21600"))   # 기본 6시간
+
+
+def _init_recently_done(conn: sqlite3.Connection) -> bool:
+    """최근 _INIT_REFRESH_SEC 안에 전체 초기화를 마쳤으면 True(→ 이번 부팅은 건너뜀)."""
+    if _INIT_REFRESH_SEC <= 0:
+        return False
+    try:
+        conn.execute("CREATE TABLE IF NOT EXISTS app_init_state(k TEXT PRIMARY KEY, v TEXT)")
+        r = conn.execute("SELECT v FROM app_init_state WHERE k='last_full_init'").fetchone()
+        if not r or not r[0]:
+            return False
+        import datetime as _dt
+        last = _dt.datetime.fromisoformat(r[0])
+        return (_dt.datetime.now() - last).total_seconds() < _INIT_REFRESH_SEC
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _mark_init_done(conn: sqlite3.Connection) -> None:
+    try:
+        conn.execute("CREATE TABLE IF NOT EXISTS app_init_state(k TEXT PRIMARY KEY, v TEXT)")
+        conn.execute("INSERT OR REPLACE INTO app_init_state(k,v) VALUES('last_full_init',?)", (_now(),))
+        conn.commit()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _ensure_indexes(conn: sqlite3.Connection) -> None:
     """목록/카운트/매칭 조인이 매 새로고침마다 1만+행을 풀스캔하지 않도록 보조 인덱스 생성.
     모두 IF NOT EXISTS — 이미 있으면 무시. 데이터/스키마 변경 없음(읽기 성능만 개선)."""
@@ -381,6 +474,8 @@ def _ensure_indexes(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_ala_collected ON ad_library_ads(collected_at)",
         "CREATE INDEX IF NOT EXISTS idx_ala_dedupe ON ad_library_ads(dedupe_key)",
         "CREATE INDEX IF NOT EXISTS idx_ala_brandid ON ad_library_ads(brand_id)",
+        # retention(보관정책): last_seen_at 기준 만료 대상 조회
+        "CREATE INDEX IF NOT EXISTS idx_ala_lastseen ON ad_library_ads(last_seen_at)",
         # 소셜 매칭 조인(ROW_NUMBER PARTITION BY ad_id ORDER BY match_score)
         "CREATE INDEX IF NOT EXISTS idx_asm_ad ON ad_social_matches(ad_id, match_score, social_id)",
         # 소셜 브랜드 카운트/조인
@@ -392,10 +487,17 @@ def _ensure_indexes(conn: sqlite3.Connection) -> None:
             conn.execute(ddl)
         except Exception:  # noqa: BLE001
             pass
+    if _init_recently_done(conn):
+        # 최근에 한 번 다 돌렸으면 건너뛴다. 인덱스는 이미 있고 백필/복원은 멱등이라 매 부팅마다
+        # 다시 할 이유가 없다(실측: 백필·복원이 init_db 3.7초 중 3.6초, 그중 Supabase 왕복 2.5초).
+        # ⚠️ 표식은 DB 안에 두므로, Cloud 가 demo.db 로 재시드하면 표식도 사라져 자동으로 다시 돈다.
+        return
+    backfill_seen_columns(conn)   # first_seen_at/last_seen_at 빈값 백필(idempotent, 삭제 없음)
     migrate_base64_thumbnails()
     migrate_brands()
     restore_scripts_from_store()   # Supabase에 백업된 스크립트 복원(영구 보존)
     restore_bookmarks_from_store()  # Supabase 북마크 복원(Cloud 재배포 후 유실 방지·팀 공유)
+    _mark_init_done(conn)
 
 
 def _migrate_legacy(conn: sqlite3.Connection) -> int:
@@ -616,10 +718,20 @@ def _group_key(f: dict) -> str:
 
 
 def count_ads(tab: str, f: dict) -> int:
+    global LAST_READ_SOURCE
     where, p = _where(tab, f)
-    conn = get_conn()
-    n = conn.execute(f"SELECT COUNT(DISTINCT {_grp(f)}) {_JOIN} WHERE {where}", p).fetchone()[0]
+    conn, src = _read_conn(f.get("brand"))
+    try:
+        n = conn.execute(f"SELECT COUNT(DISTINCT {_grp(f)}) {_JOIN} WHERE {where}", p).fetchone()[0]
+    except Exception as e:  # noqa: BLE001  (미러 이상 → 로컬로 다시)
+        conn.close()
+        if src != "supabase":
+            raise
+        print(f"  [읽기] Supabase 미러 쿼리 실패 → SQLite 재시도: {e}")
+        conn, src = get_conn(), "sqlite"
+        n = conn.execute(f"SELECT COUNT(DISTINCT {_grp(f)}) {_JOIN} WHERE {where}", p).fetchone()[0]
     conn.close()
+    LAST_READ_SOURCE = src
     return n
 
 
@@ -636,13 +748,23 @@ def load_ads_page(tab: str, f: dict, page: int = 1, page_size: int = 12) -> list
     grp = _grp(f)
     cols = _SUMMARY_COLS_WIN.format(GRP=grp, REP=_REP)
     order = _outer_order(_order(tab, f.get("sort", "")))
-    conn = get_conn()
+    global LAST_READ_SOURCE
+    conn, src = _read_conn(f.get("brand"))
+    sql = (f"SELECT * FROM (SELECT {cols} {_JOIN} WHERE {where}) t "
+           f"WHERE t.rn=1 {order} LIMIT ? OFFSET ?")
+    args = p + [page_size, max(0, (page - 1) * page_size)]
     # 윈도우로 그룹당 대표(rn=1)만 노출 + dup_rows/grp_* 로 그룹 전체값 집계(행 삭제 없음).
-    rows = conn.execute(
-        f"SELECT * FROM (SELECT {cols} {_JOIN} WHERE {where}) t "
-        f"WHERE t.rn=1 {order} LIMIT ? OFFSET ?",
-        p + [page_size, max(0, (page - 1) * page_size)]).fetchall()
+    try:
+        rows = conn.execute(sql, args).fetchall()
+    except Exception as e:  # noqa: BLE001
+        conn.close()
+        if src != "supabase":
+            raise
+        print(f"  [읽기] Supabase 미러 쿼리 실패 → SQLite 재시도: {e}")
+        conn, src = get_conn(), "sqlite"
+        rows = conn.execute(sql, args).fetchall()
     conn.close()
+    LAST_READ_SOURCE = src
     return [dict(r) for r in rows]
 
 
@@ -662,8 +784,19 @@ def get_ads_by_ids(ids: list) -> list[dict]:
 
 
 def get_ad_full(ad_id: str) -> Optional[dict]:
-    """상세 모달용 — 1건 전체 + 매칭 소셜 + 등급."""
-    conn = get_conn()
+    """상세 모달용 — 1건 전체 + 매칭 소셜 + 등급.
+    화이트리스트 브랜드 광고면 Supabase 미러에서(썸네일도 Storage URL로), 아니면 로컬 SQLite."""
+    global LAST_READ_SOURCE
+    conn, LAST_READ_SOURCE = get_conn(), "sqlite"
+    try:
+        import services.supabase_read as _sr
+        _b = _sr.ad_brand(ad_id)
+        if _b:
+            _c = _sr.conn(_b)
+            if _c is not None:
+                conn, LAST_READ_SOURCE = _c, "supabase"
+    except Exception:  # noqa: BLE001
+        pass
     r = conn.execute(f"SELECT a.*, m.match_score AS match_score, s.id AS social_id, "
                      "s.views AS social_views, s.likes AS social_likes, "
                      "s.comments AS social_comments, s.shares AS social_shares, "
@@ -861,31 +994,38 @@ def filter_options() -> dict:
 
 
 def brand_counts() -> list[dict]:
-    """등록 브랜드 전체. 📺소셜수는 approved 기준 + needs/rejected 별도(툴팁용)."""
+    """등록 브랜드 전체. 📺소셜수는 approved 기준 + needs/rejected 별도(툴팁용).
+
+    ★2026-08-11 최적화: 예전엔 브랜드마다 상관 서브쿼리 8개(=92브랜드 × 8 = 736회 스캔)를 돌려
+      5.5~7.2초가 걸렸다. 같은 결과를 **GROUP BY 2개 + 파이썬 조인**으로 계산한다(실측 10ms 내외).
+    """
     conn = get_conn()
-    rows = conn.execute("""
-        SELECT b.display_name,
-          (SELECT COUNT(*) FROM ad_library_ads a WHERE a.brand_name=b.display_name) ad_n,
-          (SELECT COUNT(*) FROM ad_library_ads a WHERE a.brand_name=b.display_name
-             AND a.platform='meta') meta_n,
-          (SELECT COUNT(*) FROM ad_library_ads a WHERE a.brand_name=b.display_name
-             AND a.platform='google') google_n,
-          (SELECT COALESCE(MAX(CASE WHEN a.status='live' THEN 1 ELSE 0 END),0)
-             FROM ad_library_ads a WHERE a.brand_name=b.display_name) live,
-          (SELECT COUNT(*) FROM social_videos s WHERE s.brand_name=b.display_name
-             AND s.review_status='approved') soc_ok,
-          (SELECT COUNT(*) FROM social_videos s WHERE s.brand_name=b.display_name
-             AND s.review_status='needs_review') soc_rev,
-          (SELECT COUNT(*) FROM social_videos s WHERE s.brand_name=b.display_name
-             AND s.review_status='rejected') soc_rej
-        FROM brands b WHERE b.is_active=1
-        ORDER BY (ad_n + soc_ok + soc_rev) DESC, b.display_name
-    """).fetchall()
+    ads = {}
+    for r in conn.execute(
+            "SELECT brand_name, COUNT(*) n, "
+            "SUM(CASE WHEN platform='meta' THEN 1 ELSE 0 END) meta_n, "
+            "SUM(CASE WHEN platform='google' THEN 1 ELSE 0 END) google_n, "
+            "MAX(CASE WHEN status='live' THEN 1 ELSE 0 END) live "
+            "FROM ad_library_ads GROUP BY brand_name"):
+        ads[r["brand_name"]] = (r["n"], r["meta_n"] or 0, r["google_n"] or 0, r["live"] or 0)
+    soc = {}
+    for r in conn.execute("SELECT brand_name, COALESCE(review_status,'needs_review') st, COUNT(*) n "
+                          "FROM social_videos GROUP BY 1, 2"):
+        d = soc.setdefault(r["brand_name"], {})
+        d[r["st"]] = r["n"]
+    names = [r["display_name"] for r in
+             conn.execute("SELECT display_name FROM brands WHERE is_active=1")]
     conn.close()
-    return [{"name": r["display_name"], "ad": r["ad_n"],
-             "meta": r["meta_n"], "google": r["google_n"], "live": r["live"],
-             "approved": r["soc_ok"], "needs": r["soc_rev"], "rejected": r["soc_rej"]}
-            for r in rows]
+    out = []
+    for nm in names:
+        a = ads.get(nm, (0, 0, 0, 0))
+        s2 = soc.get(nm, {})
+        out.append({"name": nm, "ad": a[0], "meta": a[1], "google": a[2], "live": a[3],
+                    "approved": s2.get("approved", 0), "needs": s2.get("needs_review", 0),
+                    "rejected": s2.get("rejected", 0)})
+    # 정렬 기준은 기존과 동일: (광고 + 승인소셜 + 검토소셜) 내림차순 → 이름
+    out.sort(key=lambda x: (-(x["ad"] + x["approved"] + x["needs"]), x["name"]))
+    return out
 
 
 def brand_diagnostics() -> list[dict]:
@@ -986,12 +1126,80 @@ def _quick_score(ad: dict) -> int:
     return max(0, min(100, s))
 
 
+def _landing_domain(url: str) -> str:
+    """랜딩 URL → 소문자 도메인(www. 제거). 실패 시 빈 문자열."""
+    import re as _re
+    m = _re.match(r"https?://([^/]+)", (url or "").strip(), _re.I)
+    return m.group(1).lower().replace("www.", "") if m else ""
+
+
+# 브랜드 무관 광고가 같은 page_id로 딸려 들어오는 문제(2026-07-30 AMPLE:N 1,321건) 방지용.
+#   brand_match_rules 에 pattern_type 3종을 두고 ingest 단계에서 거른다.
+#     exclude_ad_id          : 그 광고 ID는 다시 수집해도 저장 안 함
+#     exclude_landing_domain : 그 랜딩 도메인(서브도메인 포함) 광고는 저장 안 함
+#     require_brand_keyword  : 그 브랜드는 카피/제목/랜딩에 브랜드 키워드가 있어야만 저장
+_BLOCK_TYPES = ("exclude_ad_id", "exclude_landing_domain", "require_brand_keyword")
+
+
+def load_ingest_blocklist(conn=None) -> dict:
+    """ingest 차단 규칙을 읽어 dict로. {ids:set, domains:set, require:{brand:[kw,...]}}"""
+    own = conn is None
+    conn = conn or get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT pattern_type, pattern, brand_name FROM brand_match_rules "
+            f"WHERE pattern_type IN ({','.join(['?']*len(_BLOCK_TYPES))})", _BLOCK_TYPES).fetchall()
+    except Exception:  # noqa: BLE001  (테이블 없으면 차단 없음)
+        rows = []
+    out = {"ids": set(), "domains": set(), "require": {}}
+    for r in rows:
+        t, p, b = r[0], (r[1] or "").strip(), (r[2] or "").strip()
+        if not p:
+            continue
+        if t == "exclude_ad_id":
+            out["ids"].add(p)
+        elif t == "exclude_landing_domain":
+            out["domains"].add(p.lower().replace("www.", ""))
+        elif t == "require_brand_keyword":
+            out["require"].setdefault(p, []).append(b.lower())
+    if own:
+        conn.close()
+    return out
+
+
+def _blocked_reason(a: dict, bl: dict) -> str:
+    """차단 규칙에 걸리면 사유 문자열, 통과면 빈 문자열."""
+    aid = str(a.get("id") or a.get("platform_ad_id") or "")
+    if aid and aid in bl["ids"]:
+        return "excluded_ad_id"
+    d = _landing_domain(a.get("landing_url") or "")
+    if d:
+        # 정확히 일치하거나 차단 도메인의 서브도메인이면 차단(lexus.com → fresno.lexus.com)
+        for bd in bl["domains"]:
+            if d == bd or d.endswith("." + bd):
+                return f"excluded_domain:{bd}"
+    brand = a.get("brand_name") or a.get("advertiser_name") or ""
+    kws = bl["require"].get(brand)
+    if kws:
+        blob = " ".join(str(a.get(k) or "") for k in
+                        ("ad_title", "ad_copy", "landing_url", "original_ad_url")).lower()
+        if not any(k and k in blob for k in kws):
+            return f"brand_keyword_missing:{brand}"
+    return ""
+
+
 def ingest_ad_library(ads: list[dict]) -> int:
     conn = get_conn()
     n = 0
+    bl = load_ingest_blocklist(conn)
+    blocked = 0
     for a in ads:
         aid = a.get("id") or a.get("platform_ad_id")
         if not aid:
+            continue
+        why = _blocked_reason(a, bl)
+        if why:                      # 차단 규칙 해당 → 저장 안 함(재수집 방지)
+            blocked += 1
             continue
         tags = a.get("tags") or (a.get("hook_tags") or []) + (a.get("format_tags") or [])
         prev = conn.execute("SELECT * FROM ad_library_ads WHERE id=?", (aid,)).fetchone()
@@ -1050,7 +1258,11 @@ def ingest_ad_library(ads: list[dict]) -> int:
             "last_crawled_at": _now_ts,        # 이번 크롤로 row 갱신됨(ad_id upsert)
             "video_status": _vstatus,
             "page_id": a.get("page_id") or (prev or {}).get("page_id") or "",
-            "last_seen_at": _now_ts,           # 이번 크롤에서 라이브러리에 보였음
+            "last_seen_at": _now_ts,           # 이번 크롤에서 라이브러리에 보였음(매 크롤 갱신)
+            # 최초 발견일: 기존값 있으면 유지, 없으면 started_at→now (1회 고정, 분석용)
+            "first_seen_at": (prev or {}).get("first_seen_at") or a.get("started_at") or _now_ts,
+            # 수동 보존 표시: 사용자가 켠 값 유지(재수집이 덮지 않음)
+            "is_preserved": (prev or {}).get("is_preserved") or 0,
             "advertiser_name": a.get("advertiser_name") or (prev or {}).get("advertiser_name") or "",
             # 매칭 결과는 별도 매칭단계가 세팅 → 재수집 시 보존(수동지정 우선)
             "brand_status": (prev or {}).get("brand_status") or "",
@@ -1066,7 +1278,20 @@ def ingest_ad_library(ads: list[dict]) -> int:
         n += 1
     conn.commit()
     conn.close()
+    if blocked:
+        print(f"  [차단] 재수집 차단 규칙으로 {blocked}건 저장 안 함")
     return n
+
+
+def add_ingest_block(pattern_type: str, pattern: str, brand_name: str = "(제외)") -> None:
+    """ingest 차단 규칙 1건 등록. pattern_type: exclude_ad_id/exclude_landing_domain/require_brand_keyword"""
+    if pattern_type not in _BLOCK_TYPES:
+        raise ValueError(f"pattern_type must be one of {_BLOCK_TYPES}")
+    conn = get_conn()
+    conn.execute("INSERT OR REPLACE INTO brand_match_rules(pattern_type,pattern,brand_name,created_at)"
+                 " VALUES(?,?,?,?)", (pattern_type, pattern, brand_name, _now()))
+    conn.commit()
+    conn.close()
 
 
 def mark_video_expired(ad_id: str) -> None:
@@ -1307,7 +1532,9 @@ def google_review_ads(limit: int = 300) -> list[dict]:
         f"SELECT {_SUMMARY_COLS}, a.advertiser_name, a.brand_status, a.match_method, "
         f"a.match_reason, a.transparency_url, a.original_ad_url "
         f"{_JOIN} WHERE a.platform='google' AND a.brand_status IN ('company_only','unmatched') "
-        f"AND COALESCE(a.is_excluded,0)=0 GROUP BY a.id ORDER BY a.advertiser_name, a.collected_at DESC "
+        # 기본 정렬 = 조회수 높은순(2026-08-11 사용자 요청). 조회수 없는 건(NULL/0)은 뒤로.
+        f"AND COALESCE(a.is_excluded,0)=0 GROUP BY a.id "
+        f"ORDER BY COALESCE(a.yt_views,0) DESC, a.advertiser_name, a.collected_at DESC "
         f"LIMIT ?", [limit]).fetchall()
     conn.close()
     return [dict(r) for r in rows]
@@ -1321,7 +1548,7 @@ def google_excluded_ads(limit: int = 120) -> list[dict]:
         f"a.transparency_url, a.original_ad_url "
         f"{_JOIN} WHERE a.platform='google' AND "
         f"(a.brand_status='reference_excluded' OR COALESCE(a.is_excluded,0)=1) "
-        f"GROUP BY a.id ORDER BY a.collected_at DESC LIMIT ?", [limit]).fetchall()
+        f"GROUP BY a.id ORDER BY COALESCE(a.yt_views,0) DESC, a.collected_at DESC LIMIT ?", [limit]).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
@@ -1685,6 +1912,86 @@ def social_count() -> int:
     return n
 
 
+# ── 조회수 저장 방식(2026-08-11 사용자 요청) ────────────────────────────────
+#   · **최신 조회수**는 영상 단위(social_id)로 video_view_state 에 UPDATE — 매 실행마다 갱신.
+#   · **추이**는 기존 ad_view_snapshots / social_video_snapshots 그대로(과거 데이터 보존).
+#   · 신규 스냅샷은 **하루 1회만** 저장한다(같은 날 여러 번 돌아도 덮어쓰지 않음).
+VIEW_STATE_DDL = """
+CREATE TABLE IF NOT EXISTS video_view_state (
+    social_id TEXT PRIMARY KEY,          -- 영상 식별자(YouTube video_id 또는 social_videos.id)
+    platform TEXT DEFAULT '',
+    current_view_count INTEGER DEFAULT 0,
+    current_like_count INTEGER DEFAULT 0,
+    current_comment_count INTEGER DEFAULT 0,
+    last_checked_at TEXT,                -- 마지막으로 조회수를 확인한 시각
+    last_snapshot_date TEXT,             -- 마지막으로 추이 스냅샷을 남긴 날짜(YYYY-MM-DD)
+    source_url TEXT DEFAULT ''
+)"""
+
+
+def upsert_video_view_state(social_id: str, views, likes=0, comments=0,
+                            platform: str = "", source_url: str = "") -> None:
+    """영상 1건의 **최신 조회수**를 갱신(있으면 UPDATE, 없으면 INSERT). 스냅샷과 무관하게 매번 호출."""
+    if not social_id:
+        return
+    conn = get_conn()
+    conn.execute(VIEW_STATE_DDL)
+    conn.execute(
+        "INSERT INTO video_view_state(social_id,platform,current_view_count,current_like_count,"
+        "current_comment_count,last_checked_at,source_url) VALUES(?,?,?,?,?,?,?) "
+        "ON CONFLICT(social_id) DO UPDATE SET current_view_count=excluded.current_view_count,"
+        "current_like_count=excluded.current_like_count,"
+        "current_comment_count=excluded.current_comment_count,"
+        "last_checked_at=excluded.last_checked_at,"
+        "platform=CASE WHEN excluded.platform!='' THEN excluded.platform ELSE video_view_state.platform END,"
+        "source_url=CASE WHEN excluded.source_url!='' THEN excluded.source_url ELSE video_view_state.source_url END",
+        (social_id, platform, int(views or 0), int(likes or 0), int(comments or 0), _now(), source_url))
+    conn.commit()
+    conn.close()
+
+
+def get_video_view_state(social_id: str) -> Optional[dict]:
+    """영상의 최신 조회수 상태. 없으면 None."""
+    if not social_id:
+        return None
+    conn = get_conn()
+    try:
+        conn.execute(VIEW_STATE_DDL)
+        r = conn.execute("SELECT * FROM video_view_state WHERE social_id=?", (social_id,)).fetchone()
+        if r:
+            return dict(r)
+    finally:
+        conn.close()
+    # 로컬에 없으면 Supabase 에서 1건 조회(로컬 SQLite 없이 도는 상태 대비)
+    try:
+        import services.supabase_read as _sr
+        if _sr.enabled():
+            rows = _sr._fetch("video_view_state", f"select=*&social_id=eq.{social_id}")
+            return rows[0] if rows else None
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def need_snapshot_today(social_id: str) -> bool:
+    """오늘 아직 추이 스냅샷을 안 남겼으면 True (하루 1회 저장 규칙)."""
+    from datetime import date
+    st = get_video_view_state(social_id) or {}
+    return (st.get("last_snapshot_date") or "") != date.today().isoformat()
+
+
+def mark_snapshot_taken(social_id: str) -> None:
+    from datetime import date
+    if not social_id:
+        return
+    conn = get_conn()
+    conn.execute(VIEW_STATE_DDL)
+    conn.execute("UPDATE video_view_state SET last_snapshot_date=? WHERE social_id=?",
+                 (date.today().isoformat(), social_id))
+    conn.commit()
+    conn.close()
+
+
 def add_ad_snapshot(ad_id: str, views, likes, comments) -> None:
     """광고(유튜브 연결)의 일자별 조회수 스냅샷 — 조회수 추이 그래프용(같은 날짜면 갱신)."""
     from datetime import date
@@ -1701,12 +2008,39 @@ def add_ad_snapshot(ad_id: str, views, likes, comments) -> None:
 
 
 def get_ad_snapshots(ad_id: str, days: int = 30) -> list[dict]:
+    # 화이트리스트 브랜드 광고면 Supabase 에서 그 광고 추이만 1회 조회(미러엔 스냅샷을 담지 않는다).
+    try:
+        import services.supabase_read as sr
+        if sr.ad_brand(ad_id):
+            rows = sr.fetch_snapshots(ad_id, days)
+            if rows:
+                return rows
+    except Exception:  # noqa: BLE001  (실패 시 아래 로컬 경로로)
+        pass
     conn = get_conn()
     rows = [dict(r) for r in conn.execute(
         "SELECT snapshot_date, views, likes, comments FROM ad_view_snapshots "
         "WHERE ad_id=? ORDER BY snapshot_date DESC LIMIT ?", (ad_id, days)).fetchall()]
     conn.close()
     return list(reversed(rows))
+
+
+def snapshot_source_counts(ad_id: str) -> dict:
+    """이 광고 추이의 출처별 건수 — {'live': n, 'git_restore': n, 'git_yt_views': n}.
+    view_snapshot_source 컬럼이 없는 옛 DB면 전부 'live' 로 센다(그래프 표시에는 영향 없음)."""
+    conn = get_conn()
+    try:
+        rows = conn.execute("SELECT COALESCE(view_snapshot_source,'live') s, COUNT(*) "
+                            "FROM ad_view_snapshots WHERE ad_id=? GROUP BY 1", (ad_id,)).fetchall()
+        return {r[0]: r[1] for r in rows}
+    except Exception:  # noqa: BLE001
+        try:
+            n = conn.execute("SELECT COUNT(*) FROM ad_view_snapshots WHERE ad_id=?", (ad_id,)).fetchone()[0]
+            return {"live": n}
+        except Exception:  # noqa: BLE001
+            return {}
+    finally:
+        conn.close()
 
 
 def get_script_cache(cache_key: str) -> Optional[dict]:
@@ -1934,6 +2268,16 @@ def update_bookmark(ad_id: str, value: bool, username: str = "") -> None:
         BS.add(ad_id, username) if value else BS.remove(ad_id)
     except Exception:  # noqa: BLE001
         pass
+
+
+def update_preserved(ad_id: str, value: bool) -> None:
+    """수동 보존 표시 토글. is_preserved=1 이면 보관정책(60일)이 지나도 삭제 제외.
+    북마크와는 별개 개념(북마크=관심 저장, 보존=retention 삭제방지). 재수집 시 ingest가 값 유지."""
+    conn = get_conn()
+    conn.execute("UPDATE ad_library_ads SET is_preserved=?, updated_at=? WHERE id=?",
+                 (1 if value else 0, _now(), ad_id))
+    conn.commit()
+    conn.close()
 
 
 def exclude_ad(ad_id: str, value: bool = True) -> None:
