@@ -150,13 +150,18 @@ def _mirror_path(brand: str) -> Path:
 
 
 def _schema_sql() -> list[str]:
-    """로컬 LIVE DB에서 테이블 DDL을 그대로 복사 — 미러가 같은 스키마여야 같은 SQL이 돈다."""
+    """로컬 DB의 **모든 테이블 DDL**을 복사 — 미러가 같은 스키마여야 같은 SQL이 돈다.
+
+    ★ 예전엔 동기화 대상 7개 테이블만 만들었는데, 그러면 `users`·`video_script_cache` 처럼
+      Supabase로 옮기지 않는 테이블을 건드리는 코드가 `no such table` 로 죽는다
+      (실측: 로그인 시 verify_user 가 users 를 찾다가 실패). 데이터는 대상 테이블만 채우고,
+      나머지는 **빈 테이블로 만들어 두어** 기존 쿼리가 그대로 돌게 한다."""
     import database
     con = sqlite3.connect(str(database.DB_PATH))
     try:
         rows = con.execute(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name IN (%s)"
-            % ",".join("?" * len(TABLES)), TABLES).fetchall()
+            "SELECT sql FROM sqlite_master WHERE type='table' AND sql IS NOT NULL "
+            "AND name NOT LIKE 'sqlite_%'").fetchall()
         return [r[0] for r in rows if r[0]]
     finally:
         con.close()
