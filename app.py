@@ -143,7 +143,7 @@ def main() -> None:
     # ── 광고 탭(전체/Meta/Google) — SQL 페이지 로딩 ──
     tabkey = TAB_KEY.get(tab, "all")
     f = C.render_filters(_filter_options(), header, _social_count())
-    page_size = st.session_state.get("sa_psize", 20)
+    page_size = st.session_state.get("sa_psize", 40)
     page = st.session_state.get("sa_page", 1)
 
     import json

@@ -684,7 +684,7 @@ def render_add_brand() -> None:
 
 
 def render_sidebar(counts: list, total: int) -> str:
-    """counts: [{name, ad, approved, needs, rejected, live}, ...] (캐시). 상위 20개 + 검색."""
+    """counts: [{name, ad, approved, needs, rejected, live}, ...] (캐시). 전체 브랜드 + 검색."""
     sb = st.sidebar
     # 앱 타이틀(사이드바 최상단 sticky 헤더)
     sb.markdown(f"<div class='sa-sb-head'>"
@@ -765,12 +765,8 @@ def render_sidebar(counts: list, total: int) -> str:
         if not hit and not related:
             sb.caption("일치하는 브랜드가 없습니다.")
     else:
-        for r in counts[:15]:
+        for r in counts:   # 접지 않고 전체 브랜드를 바로 표시
             _brand_btn(r)
-        if len(counts) > 15:   # 나머지는 펼쳐서 전체 확인
-            _exp = sb.expander(f"📋 전체 브랜드 {len(counts)}개 보기")
-            for r in counts[15:]:
-                _brand_btn(r, _exp)
     return sel
 
 
@@ -2351,15 +2347,39 @@ def render_ad_grid(rows: list[dict], total: int, page: int, page_size: int) -> N
         for col, ad in zip(cols, rows[i:i + 4]):
             with col:
                 render_ad_card(ad, i)
-    nav = st.columns([1, 1, 6, 1])
-    if nav[0].button("◀ 이전", disabled=page <= 1, use_container_width=True):
-        st.session_state.sa_page = page - 1
+    _render_page_nav(page, total_pages)
+
+
+PAGE_GROUP = 10   # 페이지 번호를 10개씩 묶어서 표시(1~10, 11~20 …)
+
+
+def _render_page_nav(page: int, total_pages: int) -> None:
+    """« ‹ [1]…[10] › » — 번호 클릭으로 바로 이동, «/» 는 10페이지 묶음 단위 이동."""
+    def _go(p: int) -> None:
+        st.session_state.sa_page = max(1, min(total_pages, p))
         st.rerun()
-    nav[2].markdown(f"<div style='text-align:center;color:{S.SUB};font-size:13px;margin-top:6px'>"
-                    f"페이지 {page} / {total_pages}</div>", unsafe_allow_html=True)
-    if nav[1].button("다음 ▶", disabled=page >= total_pages, use_container_width=True):
-        st.session_state.sa_page = page + 1
-        st.rerun()
+
+    start = (page - 1) // PAGE_GROUP * PAGE_GROUP + 1
+    end = min(start + PAGE_GROUP - 1, total_pages)
+    nums = list(range(start, end + 1))
+    cols = st.columns([1, 1] + [1] * PAGE_GROUP + [1, 1, 4])
+    if cols[0].button("«", key="sa_pg_prevgrp", disabled=start <= 1, use_container_width=True,
+                      help=f"이전 {PAGE_GROUP}페이지"):
+        _go(start - 1)
+    if cols[1].button("‹", key="sa_pg_prev", disabled=page <= 1, use_container_width=True, help="이전 페이지"):
+        _go(page - 1)
+    for i, n in enumerate(nums):
+        if cols[2 + i].button(str(n), key=f"sa_pg_{n}", use_container_width=True,
+                              type="primary" if n == page else "secondary"):
+            _go(n)
+    if cols[2 + PAGE_GROUP].button("›", key="sa_pg_next", disabled=page >= total_pages,
+                                   use_container_width=True, help="다음 페이지"):
+        _go(page + 1)
+    if cols[3 + PAGE_GROUP].button("»", key="sa_pg_nextgrp", disabled=end >= total_pages,
+                                   use_container_width=True, help=f"다음 {PAGE_GROUP}페이지"):
+        _go(end + 1)
+    cols[4 + PAGE_GROUP].markdown(f"<div style='text-align:right;color:{S.SUB};font-size:13px;margin-top:6px'>"
+                                  f"페이지 {page} / {total_pages}</div>", unsafe_allow_html=True)
 
 
 def render_add_youtube() -> None:
